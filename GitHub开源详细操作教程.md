@@ -10,7 +10,7 @@
 2. 点击网页右上角的 **`+`** 号，选择 **`New repository`**；
 3. 填写仓库基础信息：
    - **Repository name**（仓库名称）：建议命名为 `EG4S20-HDMI-Multimedia-Player` 或 `Anlogic-EG4S20-Player`；
-   - **Description**（项目描述）：可填写 `基于国产安路EG4S20 FPGA的高保真文博展陈与应急播控多媒体系统`；
+   - **Description**（项目描述）：可填写 `基于EG4S20的全硬件播控系统`；
    - **Public / Private**（可见性）：**必须选择 `Public`（公开）**，以便评委专家免登录访问查看；
    - **⭐ 关键注意事项（极重要）**：
      - **不要勾选** `Add a README file`；

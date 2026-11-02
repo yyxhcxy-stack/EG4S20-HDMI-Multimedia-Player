@@ -5,9 +5,9 @@
 [![EDA](https://img.shields.io/badge/EDA-Tang_Dynasty_6.2+-orange.svg)](https://www.anlogic.com/)
 [![Video Output](https://img.shields.io/badge/Resolution-640x480%4060Hz-purple.svg)]()
 [![Audio Output](https://img.shields.io/badge/Audio-48kHz_24--bit_PCM-red.svg)]()
-[![Power](https://img.shields.io/badge/Power-1.187W_Low_Power-success.svg)]()
+[![Power](https://img.shields.io/badge/Power-1.09W_Low_Power-success.svg)]()
 
-> **基于国产安路科技 EG4S20BG256 FPGA 的高保真文博展陈与应急播控多媒体系统**  
+> **基于EG4S20的全硬件播控系统**  
 > 全国大学生嵌入式芯片与系统设计竞赛（FPGA 赛道）开源工程
 
 ---
@@ -16,7 +16,7 @@
 
 本项目完全基于国产自主可控的 **安路科技 EG4S20BG256 FPGA**（合封 64Mbit SDRAM），采用全硬件流水线设计，实现了一套面向文博展陈、金石碑拓鉴赏及应急广播的多媒体综合处理系统。
 
-整机满载功耗仅为 **1.187W**（5V @ 237mA，静态 0.40W），无需风扇纯被动散热，硬件时序严格收敛，具备断电秒启的非易失固化运行能力。
+整机满载功耗仅为 **1.09W**（5V @ 218mA，静态 0.40W），无需风扇纯被动散热，硬件时序严格收敛，具备断电秒启的非易失固化运行能力。
 
 ---
 
