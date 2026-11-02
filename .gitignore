@@ -1,0 +1,24 @@
+# Tang Dynasty (TD) EDA generated files
+build_ext_*/
+*.db
+*.log
+*.logw
+*.jou
+*_Runs/
+phy_*/
+syn_*/
+work/
+transcript
+*.tmp
+*.bak
+
+# BitWriter temporary files
+temp_*.tcl
+flash_program_*.tcl
+
+# OS & Editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.vscode/
+*.idea/

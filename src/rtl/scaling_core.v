@@ -1,0 +1,155 @@
+// Compact source stream -> compact scaled stream, both at memory clock.
+// Three rotating source lines; five clocks/pixel; nine pipelined 9x13 multipliers (six DSP net budget).
+module scaling_core(
+ input clk,rst,start, input [1:0] mode, input [10:0] width,input [9:0] height,
+ input src_empty, input [23:0] src_data, output src_read,
+ input out_full, output out_write, output [23:0] out_data,
+ output [9:0] out_w,output [8:0] out_h,output config_ready,output reg done
+);
+ reg [10:0] w;reg [9:0] h;reg [1:0] m;
+ wire [10:0] crop_x,rem_x,den_x;wire [9:0] crop_y,rem_y,den_y;
+ wire [13:0] step_x,step_y;
+ scaling_geometry geometry(
+  .clk(clk),.rst(rst),.start(start),.mode(mode),.width(width),.height(height),.ready(config_ready),
+  .out_w(out_w),.out_h(out_h),.crop_x(crop_x),.crop_y(crop_y),.step_x(step_x),.step_y(step_y),
+  .rem_x(rem_x),.rem_y(rem_y),.den_x(den_x),.den_y(den_y)
+ );
+ reg [22:0] cx;reg [21:0] cy;reg [10:0] ex;reg [9:0] ey;
+ reg [9:0] ox;reg [8:0] oy;
+ wire [11:0] ex_next={1'b0,ex}+{1'b0,rem_x};wire [10:0] ey_next={1'b0,ey}+{1'b0,rem_y};
+ reg [11:0] x_sum_q;reg [10:0] y_sum_q;
+ reg x_carry_q,y_carry_q;reg [10:0] x_remainder_q;reg [9:0] y_remainder_q;
+ // Coordinates remain stable for five clocks; prepare DDA carry in two stages.
+ always @(posedge clk) begin
+  x_sum_q<=ex_next;y_sum_q<=ey_next;
+  x_carry_q<=x_sum_q>={1'b0,den_x};y_carry_q<=y_sum_q>={1'b0,den_y};
+  x_remainder_q<=x_sum_q>={1'b0,den_x}?x_sum_q-den_x:x_sum_q[10:0];
+  y_remainder_q<=y_sum_q>={1'b0,den_y}?y_sum_q-den_y:y_sum_q[9:0];
+ end
+ wire [10:0] sx=cx[22:12];reg [9:0] sy,sy1;
+ reg [10:0] last_x,row_last_x,prefetch_limit;reg [9:0] last_y;
+ reg [9:0] out_w_minus_1;reg [8:0] out_h_minus_1;
+ reg ox_last,oy_last;
+ always @(posedge clk)begin
+  out_w_minus_1<=out_w-1'b1;
+  out_h_minus_1<=out_h-1'b1;
+  row_last_x<=start ? width-1'b1 : w-1'b1;
+  prefetch_limit<={1'b0,sy}+11'd2;
+  ox_last<=(ox==out_w_minus_1);oy_last<=(oy==out_h_minus_1);
+  last_x<=(m==1&&w>320)?crop_x+11'd319:w-1'b1;
+  last_y<=start ? ((mode==0&&height>480)?10'd480:(mode==1&&height>240)?10'd240:height-1'b1) : ((m==0&&h>480)?10'd480:(m==1&&h>240)?10'd240:h-1'b1);
+ end
+ reg [10:0] sx1,prepared_neighbor;
+ reg [10:0] next_read_x;
+ // Prepare the neighbor while coordinates are stable, then commit at OUT.
+ // This removes carry/comparison logic from the 125 MHz BRAM address path.
+ always @(posedge clk)prepared_neighbor<=next_read_x<last_x ? next_read_x+1'b1 : next_read_x;
+ reg [3:0] state;
+ localparam WAIT=0,A=1,B=2,H=3,V=4,OUT=5,FLUSH_A=6,FLUSH_B=7,B_WAIT=8,ROW0=9,CONFIG=10,ROW1=11;
+ // Read the next pixel one clock earlier to use the BRAM output register.
+ wire [22:0] next_cx=cx+{9'd0,step_x}+{22'd0,x_carry_q};
+ always @(posedge clk)next_read_x<=next_cx[22:12];
+ wire [9:0] raddr=state==OUT?(ox_last?crop_x[9:0]:next_read_x[9:0]):
+     ((state==B||state==B_WAIT||state==A)?sx1[9:0]:sx[9:0]);
+ reg [23:0] line0[0:1023],line1[0:1023],line2[0:1023];
+ reg [23:0] q0,q1,q2,ram_q0,ram_q1,ram_q2;
+ reg [9:0] tag0,tag1,tag2;
+ reg [2:0] valid;
+ reg [10:0] ix,px;reg [9:0] iy,py;reg [1:0] bank,pbank;reg pending,pending_last;
+ wire active=config_ready&&!done;
+ // Never overwrite either row currently used by interpolation.
+ assign src_read=config_ready && iy<=last_y && (done || iy<=prefetch_limit) && !src_empty;
+ always @(posedge clk) begin
+  if(pending) case(pbank) 0:line0[px[9:0]]<=src_data;1:line1[px[9:0]]<=src_data;2:line2[px[9:0]]<=src_data;endcase
+  ram_q0<=line0[raddr];ram_q1<=line1[raddr];ram_q2<=line2[raddr];
+  q0<=ram_q0;q1<=ram_q1;q2<=ram_q2;
+ end
+ always @(posedge clk or posedge rst) begin
+  if(rst) begin ix<=0;iy<=0;px<=0;py<=0;bank<=0;pbank<=0;pending<=0;pending_last<=0;valid<=0;tag0<=0;tag1<=0;tag2<=0;end
+  else if(start) begin ix<=0;iy<=0;bank<=0;pending<=0;pending_last<=0;valid<=0;end
+  else begin
+   pending<=src_read;
+   // Predecode row completion alongside the accepted source address.
+   pending_last<=src_read&&(ix==row_last_x);
+   if(src_read) begin
+    px<=ix;py<=iy;pbank<=bank;
+    if(ix==row_last_x) begin ix<=0;iy<=iy+1'b1;bank<=bank==2?0:bank+1'b1;end else ix<=ix+1'b1;
+   end
+   if(pending) begin
+    if(px==0) valid[pbank]<=0;
+    if(pending_last) begin valid[pbank]<=1;case(pbank)0:tag0<=py;1:tag1<=py;2:tag2<=py;endcase end
+   end
+  end
+ end
+ wire top_ok=(valid[0]&&tag0==sy)||(valid[1]&&tag1==sy)||(valid[2]&&tag2==sy);
+ wire bottom_ok=(valid[0]&&tag0==sy1)||(valid[1]&&tag1==sy1)||(valid[2]&&tag2==sy1);
+ reg top_ok_q,bottom_ok_q;
+ always @(posedge clk) begin
+  top_ok_q<=(state==WAIT)&&top_ok;bottom_ok_q<=(state==WAIT)&&bottom_ok;
+ end
+ // Row selection settles in WAIT and stays fixed while rendering that row.
+ reg [1:0] top_bank,bottom_bank;
+ always @(posedge clk) if(state==WAIT) begin
+  top_bank<=(tag0==sy&&valid[0])?0:(tag1==sy&&valid[1])?1:2;
+  bottom_bank<=(tag0==sy1&&valid[0])?0:(tag1==sy1&&valid[1])?1:2;
+ end
+ wire [23:0] qt=top_bank==0?q0:top_bank==1?q1:q2;
+ wire [23:0] qb=bottom_bank==0?q0:bottom_bank==1?q1:q2;
+ reg [23:0] a,b,base;reg previous_valid;reg [11:0] fx,fy;
+ reg signed [8:0] dh0[0:2],dh1[0:2],dv[0:2];
+
+ wire [7:0] horiz0[0:2],horiz1[0:2];
+ reg signed [21:0] prod0[0:2],prod1[0:2],prodv[0:2];
+ genvar c;
+ generate for(c=0;c<3;c=c+1) begin:channels
+  wire [7:0] ac=a[c*8+:8],bc=b[c*8+:8];
+  wire signed [21:0] hr0=$signed({1'b0,ac,12'b0})+prod0[c]+22'sd2048;
+  wire signed [21:0] hr1=$signed({1'b0,bc,12'b0})+prod1[c]+22'sd2048;
+  // Only the rounded integer byte is needed; the shifted base has zero fractional bits.
+  assign horiz0[c]=ac+prod0[c][19:12]+prod0[c][11];
+  assign horiz1[c]=bc+prod1[c][19:12]+prod1[c][11];
+  reg [11:0] horizontal_phase;
+  // Capture the stable source coordinate without async reset so TD can
+  // absorb this register into the multiplier input pipeline.
+  always @(posedge clk) horizontal_phase<=m==2 ? 12'd2048 : cx[11:0];
+  wire signed [21:0] vr=$signed({1'b0,base[c*8+:8],12'b0})+prodv[c]+22'sd2048;
+  wire [8:0] half_sum={1'b0,horiz0[c]}+{1'b0,horiz1[c]}+{8'd0,!(prod0[c][11]||prod1[c][11])};
+  assign out_data[c*8+:8]=m==2?base[c*8+:8]:vr[19:12];
+  always @(posedge clk) begin
+   prod0[c]<=dh0[c]*$signed({1'b0,horizontal_phase});prod1[c]<=dh1[c]*$signed({1'b0,horizontal_phase});
+   prodv[c]<=dv[c]*$signed({1'b0,fy});
+   dh0[c]<=$signed({1'b0,qt[c*8+:8]})-$signed({1'b0,ac});
+   dh1[c]<=$signed({1'b0,qb[c*8+:8]})-$signed({1'b0,bc});
+   if(state==OUT) begin
+    base[c*8+:8]<=m==2?half_sum[8:1]:horiz0[c];dv[c]<=$signed({1'b0,horiz1[c]})-$signed({1'b0,horiz0[c]});
+   end
+  end
+ end endgenerate
+ assign out_write=(state==B||state==B_WAIT||state==FLUSH_B)&&previous_valid&&!out_full;
+ always @(posedge clk or posedge rst) begin
+  if(rst) begin w<=640;h<=480;m<=0;cx<=0;cy<=0;ex<=0;ey<=0;ox<=0;oy<=0;state<=CONFIG;sx1<=0;sy<=0;sy1<=0;done<=0;a<=0;b<=0;previous_valid<=0;fx<=0;fy<=0;end
+  else if(start) begin w<=width;h<=height;m<=mode;cx<=0;cy<=0;ex<=0;ey<=0;ox<=0;oy<=0;state<=CONFIG;sx1<=0;sy<=0;sy1<=0;done<=0;previous_valid<=0;sx1<=0;end
+  else case(state)
+   CONFIG:if(config_ready)state<=ROW0;
+   ROW0:begin sy<=crop_y+cy[21:12];cx<={crop_x,12'd0};state<=ROW1;end
+   ROW1:begin sy1<=sy<last_y?sy+1'b1:sy;sx1<=crop_x<last_x ? crop_x+1'b1 : crop_x;state<=WAIT;end
+   WAIT: if(active&&top_ok_q&&bottom_ok_q&&!out_full) state<=A;
+   A: state<=B;
+   B: begin a<=qt;b<=qb;if(previous_valid&&out_full)state<=B_WAIT;else begin state<=H;previous_valid<=0;end end
+   B_WAIT:if(!out_full)begin state<=H;previous_valid<=0;end
+   H: begin fx<=cx[11:0];state<=V;end
+   V: state<=OUT;
+   OUT: begin previous_valid<=1;fy<=cy[11:0];sx1<=prepared_neighbor;
+    if(ox_last) begin
+     ox<=0;cx<={crop_x,12'd0};ex<=0;
+     cy<=cy+{8'd0,step_y}+{21'd0,y_carry_q};ey<=y_remainder_q;
+     oy<=oy+1'b1;state<=ROW0;
+     if(oy_last) state<=FLUSH_A;
+    end else begin ox<=ox+1'b1;cx<=next_cx;ex<=x_remainder_q;state<=A;end
+   end
+   FLUSH_A:if(!out_full)state<=FLUSH_B;
+   FLUSH_B:if(!out_full)begin previous_valid<=0;done<=1;state<=WAIT;end
+   default:state<=WAIT;
+  endcase
+ end
+endmodule

@@ -1,0 +1,374 @@
+`timescale 1ns/1ps
+module frame_fifo_write
+#
+(
+	parameter MEM_DATA_BITS          = 32,
+	parameter ADDR_BITS              = 21,
+	parameter BURST_BITS             = 9,
+	parameter BURST_SIZE             = 128,
+	parameter WRITE_V_FLIP           = 1,      // 1: write image rows upside-down to cancel BMP bottom-up storage
+	parameter FRAME_WIDTH            = 640,
+	parameter FRAME_HEIGHT           = 480
+)               
+(
+	input                            rst,                  
+	input                            mem_clk,                    // external memory controller user interface clock
+	input							 Sdr_init_done,
+	input							 Sdr_init_ref_vld,
+    input							 Sdr_busy,
+	input							 App_rd_busy,
+    output							 O_wr_busy,
+	
+	output 							 App_wr_en,
+	output  [ADDR_BITS - 1:0]	 	App_wr_addr,
+	/*
+    output reg                       wr_burst_req,               // to external memory controller,send out a burst write request  
+	output reg[BURST_BITS - 1:0]     wr_burst_len,               // to external memory controller,data length of the burst write request, not bytes 
+	output reg[ADDR_BITS - 1:0]      wr_burst_addr,              // to external memory controller,base address of the burst write request 
+	input                            wr_burst_data_req,          // from external memory controller,write data request ,before data 1 clock 
+	input                            wr_burst_finish,            // from external memory controller,burst write finish
+	*/
+	input                            write_req,                  // data write module write request,keep '1' until read_req_ack = '1'
+	output reg                       write_req_ack,              // data write module write request response
+	output                           write_finish,               // data write module write request finish
+	input[ADDR_BITS - 1:0]           write_addr_0,               // data write module write request base address 0, used when write_addr_index = 0
+	input[ADDR_BITS - 1:0]           write_addr_1,               // data write module write request base address 1, used when write_addr_index = 1
+	input[ADDR_BITS - 1:0]           write_addr_2,               // data write module write request base address 1, used when write_addr_index = 2
+	input[ADDR_BITS - 1:0]           write_addr_3,               // data write module write request base address 1, used when write_addr_index = 3
+	input[1:0]                       write_addr_index,           // select valid base address from write_addr_0 write_addr_1 write_addr_2 write_addr_3
+	input[ADDR_BITS - 1:0]           write_len,                  // data write module write request data length
+	input[15:0]                      img_width,                  // image width
+	input[15:0]                      img_height,                 // image height
+	output reg                       fifo_aclr,                  // to fifo asynchronous clear
+	input[9:0]                      rdusedw                     // from fifo read used words
+);
+localparam ONE                       = 256'd1;                   //256 bit '1'   you can use ONE[n-1:0] for n bit '1'
+localparam ZERO                      = 256'd0;                   //256 bit '0'
+
+reg [15:0]                          img_width_d0, img_width_d1;
+reg [15:0]                          img_height_d0, img_height_d1;
+
+reg width_zero_d1, height_zero_d1;
+wire [15:0] eff_w = width_zero_d1 ? 16'd640 : img_width_d1;
+wire [15:0] eff_h = height_zero_d1 ? 16'd480 : img_height_d1;
+
+// Dynamic vertical flip address mapping for any W x H frame buffer (Registered pipeline to meet 125MHz Fmax)
+reg [ADDR_BITS - 1:0] vflip_first_offset;
+reg [ADDR_BITS - 1:0] vflip_line_step;
+reg [10:0]            vflip_line_last_x;
+reg                   write_single_column;
+reg [9:0]             vflip_rows_minus_one;
+reg [10:0]            vflip_width;
+
+always @(posedge mem_clk or posedge rst) begin
+    if (rst) begin
+        vflip_line_step    <= {ADDR_BITS{1'b1}} - 1278; // -1279
+        vflip_line_last_x  <= 11'd639;
+        write_single_column <= 1'b0;
+    end else begin
+        // Width/height remain stable throughout the request handshake.
+        // Split subtract and multiply, and use the actual supported widths.
+        // Width is 1..1024, so 1-2*width is negative and fits in 12 bits.
+        // 1-2*w == ~((w-1)<<1). The previous registered last column
+        // settles before S_ACK/burst admission; this path needs no subtractor.
+        vflip_line_step    <= {{(ADDR_BITS-12){1'b1}}, ~{vflip_line_last_x,1'b0}};
+        vflip_line_last_x  <= eff_w[10:0] - 11'd1;
+        write_single_column <= (eff_w == 16'd1);
+    end
+end
+
+// The request uses three synchronizer stages and S_ACK before addresses are
+// consumed. These unconditional stages settle first and can pack into the DSP;
+// the command/state registers still have their original asynchronous reset.
+always @(posedge mem_clk) begin
+    vflip_rows_minus_one <= eff_h[9:0] - 10'd1;
+    vflip_width <= eff_w[10:0];
+    vflip_first_offset <= vflip_rows_minus_one * vflip_width;
+end
+
+//write state machine code
+localparam S_IDLE                    = 0;                        //idle state,waiting for write
+localparam S_ACK                     = 1;                        //written request response
+localparam S_CHECK_FIFO              = 2;                        //check the FIFO status, ensure that there is enough space to burst write
+localparam S_WRITE_BURST             = 3;                        //begin a burst write
+localparam S_WRITE_BURST_END         = 4;                        //a burst write complete
+localparam S_END                     = 5;                        //a frame of data is written to complete
+
+
+reg                                 write_req_d0;                //asynchronous write request, synchronize to 'mem_clk' clock domain,first beat
+reg                                 write_req_d1;                //the second
+reg                                 write_req_d2;                //third,Why do you need 3 ? Here's the design habit
+reg[ADDR_BITS - 1:0]                write_len_d0;                //asynchronous write_len(write data length), synchronize to 'mem_clk' clock domain first
+reg[ADDR_BITS - 1:0]                write_len_d1;                //second
+reg[ADDR_BITS - 1:0]                write_len_latch;             //lock write data length
+reg[ADDR_BITS - 1:0]                write_cnt;                   //write data counter
+reg[1:0]                            write_addr_index_d0;
+reg[1:0]                            write_addr_index_d1;
+reg[3:0]                            state;                       //state machine
+reg [ADDR_BITS - 1:0]	 App_wr_addr_r;
+reg [10:0]                            wr_x; // remaining columns after current pixel
+reg                                   wr_line_last;
+// Select after the arithmetic, so the row-boundary control does not
+// travel through the full address carry chain at 125 MHz.
+wire [ADDR_BITS-1:0] write_address_step=(WRITE_V_FLIP && wr_line_last)?vflip_line_step:ONE[ADDR_BITS-1:0];
+
+reg [BURST_BITS - 1:0]				burst_cnt;
+reg [BURST_BITS - 1:0]               burst_limit;
+reg                                 burst_limit_valid;
+reg                                 burst_fifo_ready;
+wire [ADDR_BITS - 1:0]              remaining_words = write_len_latch - write_cnt;
+always @(posedge mem_clk or posedge rst) begin
+    if (rst) begin
+        burst_limit <= BURST_SIZE;
+        burst_limit_valid <= 1'b0;
+        burst_fifo_ready <= 1'b0;
+    end else begin
+        burst_limit_valid <= (state == S_CHECK_FIFO);
+        // Occupancy cannot fall while checking: only this writer drains it.
+        // Register the comparison before admission; recheck readers live.
+        burst_fifo_ready <= burst_limit_valid && (state == S_CHECK_FIFO) && (rdusedw >= burst_limit);
+        if (state == S_CHECK_FIFO)
+        // write_cnt advances by an aligned fixed burst; avoid subtracting
+        // all address bits merely to determine whether a full burst remains.
+        if ((BURST_SIZE & (BURST_SIZE-1)) == 0)
+            burst_limit <= ((write_len_latch >> $clog2(BURST_SIZE)) != (write_cnt >> $clog2(BURST_SIZE))) ?
+                BURST_SIZE : (write_len_latch % BURST_SIZE);
+        else
+            burst_limit <= (remaining_words < BURST_SIZE) ? remaining_words[BURST_BITS-1:0] : BURST_SIZE;
+    end
+end
+wire								wr_burst_finish;
+
+reg App_wr_en_r;
+reg App_wr_en_d0;
+
+wire into_burst;
+// Wait for this burst's limit to settle before using it. Only this module
+// drains the FIFO, so occupancy cannot decrease while S_CHECK_FIFO waits.
+assign into_burst = burst_limit_valid && burst_fifo_ready && ~App_rd_busy;
+
+assign App_wr_addr = {App_wr_addr_r[ADDR_BITS - 1:0]};
+//assign O_wr_busy = (state != S_IDLE || (S_IDLE && write_req_d2));
+assign O_wr_busy = (state == S_WRITE_BURST || (state == S_CHECK_FIFO && into_burst));//在突发，或者将要突发，则显示busy
+assign wr_burst_finish = (burst_cnt == burst_limit);
+assign write_finish = (state == S_END) ? 1'b1 : 1'b0;            //write finish at state 'S_END'
+assign App_wr_en = App_wr_en_d0;
+
+
+always@(posedge mem_clk or posedge rst)
+begin
+	if(rst == 1'b1)
+	begin
+		write_req_d0    <=  1'b0;
+		write_req_d1    <=  1'b0;
+		write_req_d2    <=  1'b0;
+		write_len_d0    <=  ZERO[ADDR_BITS - 1:0];              //equivalent to write_len_d0 <= 0;
+		write_len_d1    <=  ZERO[ADDR_BITS - 1:0];              //equivalent to write_len_d1 <= 0;
+		write_addr_index_d0    <=  2'b00;
+		img_width_d0    <=  16'd640;
+		img_width_d1    <=  16'd640;
+		img_height_d0   <=  16'd480;
+		img_height_d1   <=  16'd480;
+        width_zero_d1 <= 1'b0;
+        height_zero_d1 <= 1'b0;
+	end
+	else
+	begin
+		write_req_d0    <=  write_req;
+		write_req_d1    <=  write_req_d0;
+		write_req_d2    <=  write_req_d1;
+		write_len_d0    <=  write_len;
+		write_len_d1    <=  write_len_d0;
+		write_addr_index_d0 <= write_addr_index;
+		write_addr_index_d1 <= write_addr_index_d0;
+		img_width_d0    <=  img_width;
+		img_width_d1    <=  img_width_d0;
+		img_height_d0   <=  img_height;
+		img_height_d1   <=  img_height_d0;
+        // Decode alongside the second CDC stage, preserving latency.
+        width_zero_d1 <= (img_width_d0 == 16'd0);
+        height_zero_d1 <= (img_height_d0 == 16'd0);
+	end 
+end
+always @(posedge mem_clk or posedge rst)
+begin
+	if(rst == 1'b1)
+	begin
+		burst_cnt <= ZERO[BURST_BITS - 1:0];
+		App_wr_addr_r <= ZERO[ADDR_BITS - 1:0];
+		App_wr_en_d0 <= 1'b0;
+		wr_x <= 11'd0;
+		wr_line_last <= 1'b0;
+	end
+	else begin
+	
+		if(state == S_CHECK_FIFO)
+			burst_cnt <= ZERO[BURST_BITS - 1:0];
+		else if(App_wr_en)
+			burst_cnt <= burst_cnt + 1'b1;
+		else
+			burst_cnt <= burst_cnt;
+		//
+		if(state == S_ACK)
+			begin
+				wr_x <= vflip_line_last_x;
+				wr_line_last <= write_single_column;
+				if(write_addr_index_d1 == 2'd0)
+					App_wr_addr_r <= WRITE_V_FLIP ? (write_addr_0 + vflip_first_offset) : write_addr_0;
+				else if(write_addr_index_d1 == 2'd1)
+					App_wr_addr_r <= WRITE_V_FLIP ? (write_addr_1 + vflip_first_offset) : write_addr_1;
+				else if(write_addr_index_d1 == 2'd2)
+					App_wr_addr_r <= WRITE_V_FLIP ? (write_addr_2 + vflip_first_offset) : write_addr_2;
+				else if(write_addr_index_d1 == 2'd3)
+					App_wr_addr_r <= WRITE_V_FLIP ? (write_addr_3 + vflip_first_offset) : write_addr_3;
+			end
+		else if(App_wr_en)
+			begin
+				if(WRITE_V_FLIP)
+				begin
+					// Decode one command ahead; address updates use a single
+					// registered bit instead of compare -> subtract -> mux.
+					if(wr_line_last)
+					begin
+						wr_x <= vflip_line_last_x;
+						wr_line_last <= write_single_column;
+					end
+					else
+					begin
+						wr_x <= wr_x - 1'b1;
+						wr_line_last <= (wr_x == 11'd1);
+					end
+				end
+				// One shared address adder; row boundary is decoded in advance.
+				App_wr_addr_r <= App_wr_addr_r + write_address_step;
+			end
+		else
+			App_wr_addr_r <= App_wr_addr_r;
+		//
+		if(App_wr_en_r && burst_cnt + App_wr_en < burst_limit)begin
+            App_wr_en_d0 <= 1'b1;
+        end
+		else
+			App_wr_en_d0 <= 1'b0;
+	
+	end		
+end
+always@(posedge mem_clk or posedge rst)
+begin
+	if(rst == 1'b1)
+	begin
+		state <= S_IDLE;
+		write_len_latch <= ZERO[ADDR_BITS - 1:0];
+		
+		//wr_burst_addr <= ZERO[ADDR_BITS - 1:0];
+		//wr_burst_req <= 1'b0;
+		App_wr_en_r <= 1'b0;
+		
+		write_cnt <= ZERO[ADDR_BITS - 1:0];
+		fifo_aclr <= 1'b0;
+		write_req_ack <= 1'b0;
+		//wr_burst_len <= ZERO[BURST_BITS - 1:0];
+		
+		
+	end
+	else 
+		case(state)
+			//idle state,waiting for write write_req_d2 == '1' goto the 'S_ACK'
+			S_IDLE:
+			begin
+				if(write_req_d2 == 1'b1 && Sdr_init_done)
+				begin
+					state <= S_ACK;
+				end
+				write_req_ack <= 1'b0;
+			end
+			//'S_ACK' state completes the write request response, the FIFO reset, the address latch, and the data length latch
+			S_ACK:
+			begin
+				//after write request revocation(write_req_d2 == '0'),goto 'S_CHECK_FIFO',write_req_ack goto '0'
+				if(write_req_d2 == 1'b0)
+				begin
+					state <= S_CHECK_FIFO;
+					fifo_aclr <= 1'b0;
+					write_req_ack <= 1'b0;
+				end
+				else
+				begin
+					//write request response
+					write_req_ack <= 1'b1;
+					//FIFO reset
+					fifo_aclr <= 1'b1;
+					//select valid base address from write_addr_0 write_addr_1 write_addr_2 write_addr_3
+					/*
+					if(write_addr_index_d1 == 2'd0)
+						wr_burst_addr <= write_addr_0;
+					else if(write_addr_index_d1 == 2'd1)
+						wr_burst_addr <= write_addr_1;
+					else if(write_addr_index_d1 == 2'd2)
+						wr_burst_addr <= write_addr_2;
+					else if(write_addr_index_d1 == 2'd3)
+						wr_burst_addr <= write_addr_3;
+					*/
+					//latch data length
+					write_len_latch <= write_len_d1;                    
+				end
+				//write data counter reset, write_cnt <= 0;
+				write_cnt <= ZERO[ADDR_BITS - 1:0];
+			end
+			S_CHECK_FIFO:
+			begin
+				//if there is a write request at this time, enter the 'S_ACK' state
+				if(write_req_d2 == 1'b1)
+				begin
+					state <= S_ACK;
+				end
+				//if the FIFO space is a burst write request, goto burst write state
+				else if(into_burst)
+				begin
+					state <= S_WRITE_BURST;
+					//wr_burst_len <= BURST_SIZE[BURST_BITS - 1:0];
+					//wr_burst_req <= 1'b1;
+					App_wr_en_r <= 1'b1;
+				end
+			end 
+			
+			S_WRITE_BURST:
+			begin
+				//burst finish
+				if(wr_burst_finish == 1'b1)
+				begin
+					App_wr_en_r <= 1'b0;
+					state <= S_WRITE_BURST_END;
+					//write counter + burst length
+					write_cnt <= write_cnt + BURST_SIZE[ADDR_BITS - 1:0];
+					//the next burst write address is generated
+					//wr_burst_addr <= wr_burst_addr + BURST_SIZE[ADDR_BITS - 1:0];
+				end     
+			end
+			S_WRITE_BURST_END:
+			begin
+				//if there is a write request at this time, enter the 'S_ACK' state
+				if(write_req_d2 == 1'b1)
+				begin
+					state <= S_ACK;
+				end
+				//if the write counter value is less than the frame length, continue writing,
+				//otherwise the writing is complete
+				else if(write_cnt < write_len_latch)
+				begin
+					state <= S_CHECK_FIFO;
+				end
+				else
+				begin
+					state <= S_END;
+				end
+			end
+			S_END:
+			begin
+				state <= S_IDLE;
+			end
+			default:
+				state <= S_IDLE;
+		endcase
+end
+endmodule

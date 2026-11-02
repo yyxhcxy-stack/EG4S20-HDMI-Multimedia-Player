@@ -1,0 +1,33 @@
+module sd_command_equivalence(
+input                       sys_clk,input                       rst,input[15:0]                 spi_clk_div,input                       cmd_req,input[47:0]                 cmd,input[7:0]                  cmd_r1,input[15:0]                 cmd_data_len,input                       block_read_req,input                       block_write_req,input[7:0]                  block_write_data,input                       spi_wr_ack,input[7:0]                  spi_data_out,output mismatch,output ref_error,ref_cmd_ack,ref_read_ack,ref_block_valid,ref_write_ack);
+wire actual_cmd_req_ack;
+wire actual_cmd_req_error;
+wire actual_block_read_valid;
+wire [7:0]             actual_block_read_data;
+wire actual_block_read_req_ack;
+wire actual_block_write_data_rd;
+wire actual_block_write_req_ack;
+wire actual_nCS_ctrl;
+wire [15:0]            actual_clk_div;
+wire actual_spi_wr_req;
+wire [7:0]                 actual_spi_data_in;
+sd_card_cmd actual(.sys_clk(sys_clk),.rst(rst),.spi_clk_div(spi_clk_div),.cmd_req(cmd_req),.cmd(cmd),.cmd_r1(cmd_r1),.cmd_data_len(cmd_data_len),.block_read_req(block_read_req),.block_write_req(block_write_req),.block_write_data(block_write_data),.spi_wr_ack(spi_wr_ack),.spi_data_out(spi_data_out),.cmd_req_ack(actual_cmd_req_ack),.cmd_req_error(actual_cmd_req_error),.block_read_valid(actual_block_read_valid),.block_read_data(actual_block_read_data),.block_read_req_ack(actual_block_read_req_ack),.block_write_data_rd(actual_block_write_data_rd),.block_write_req_ack(actual_block_write_req_ack),.nCS_ctrl(actual_nCS_ctrl),.clk_div(actual_clk_div),.spi_wr_req(actual_spi_wr_req),.spi_data_in(actual_spi_data_in));
+wire gold_cmd_req_ack;
+wire gold_cmd_req_error;
+wire gold_block_read_valid;
+wire [7:0]             gold_block_read_data;
+wire gold_block_read_req_ack;
+wire gold_block_write_data_rd;
+wire gold_block_write_req_ack;
+wire gold_nCS_ctrl;
+wire [15:0]            gold_clk_div;
+wire gold_spi_wr_req;
+wire [7:0]                 gold_spi_data_in;
+sd_card_cmd_reference gold(.sys_clk(sys_clk),.rst(rst),.spi_clk_div(spi_clk_div),.cmd_req(cmd_req),.cmd(cmd),.cmd_r1(cmd_r1),.cmd_data_len(cmd_data_len),.block_read_req(block_read_req),.block_write_req(block_write_req),.block_write_data(block_write_data),.spi_wr_ack(spi_wr_ack),.spi_data_out(spi_data_out),.cmd_req_ack(gold_cmd_req_ack),.cmd_req_error(gold_cmd_req_error),.block_read_valid(gold_block_read_valid),.block_read_data(gold_block_read_data),.block_read_req_ack(gold_block_read_req_ack),.block_write_data_rd(gold_block_write_data_rd),.block_write_req_ack(gold_block_write_req_ack),.nCS_ctrl(gold_nCS_ctrl),.clk_div(gold_clk_div),.spi_wr_req(gold_spi_wr_req),.spi_data_in(gold_spi_data_in));
+assign mismatch={actual_cmd_req_ack,actual_cmd_req_error,actual_block_read_valid,actual_block_read_data,actual_block_read_req_ack,actual_block_write_data_rd,actual_block_write_req_ack,actual_nCS_ctrl,actual_clk_div,actual_spi_wr_req,actual_spi_data_in}!={gold_cmd_req_ack,gold_cmd_req_error,gold_block_read_valid,gold_block_read_data,gold_block_read_req_ack,gold_block_write_data_rd,gold_block_write_req_ack,gold_nCS_ctrl,gold_clk_div,gold_spi_wr_req,gold_spi_data_in};
+assign ref_error=gold_cmd_req_error;
+assign ref_cmd_ack=gold_cmd_req_ack;
+assign ref_read_ack=gold_block_read_req_ack;
+assign ref_block_valid=gold_block_read_valid;
+assign ref_write_ack=gold_block_write_req_ack;
+endmodule
